@@ -18,11 +18,9 @@ IGNORE_INDEX = -100
 @dataclass(frozen=True)
 class LMSample:
     """语言模型训练样本。
-
     input_ids 是喂给模型的 token 序列。
     labels 是监督目标，和 input_ids 等长；不参与 loss 的位置填 IGNORE_INDEX。
     """
-
     input_ids: torch.Tensor
     labels: torch.Tensor
 
@@ -32,11 +30,9 @@ def pre_processing_chat(
     add_system_ratio: float = 0.2,
 ) -> list[dict[str, Any]]:
     """对 SFT 对话做和原始 MiniMind 相同的轻量预处理。
-
     原始项目会以一定概率给没有 system 的普通对话补一个 system prompt。
     tool-use 数据结构更复杂，直接保留，避免破坏工具调用格式。
     """
-
     if any(message.get("tools") for message in conversations):
         return conversations
 
@@ -76,21 +72,17 @@ def post_processing_chat(prompt: str, empty_think_ratio: float = 0.2) -> str:
 
 class JsonlDataset(Dataset):
     """基于 JSONL 行偏移的数据集基类。
-
     这里只保存每一行在文件里的 byte offset，不保存完整样本内容。
     好处是大文件训练时内存占用稳定；真正取样本时再 seek 到对应行读取。
     """
-
     def __init__(self, data_path: str | Path):
         super().__init__()
         self.data_path = Path(data_path)
         if not self.data_path.exists():
             raise FileNotFoundError(f"找不到数据集文件：{self.data_path}")
-
         self.offsets = self._build_offsets(self.data_path)
         if not self.offsets:
             raise ValueError(f"数据集文件为空：{self.data_path}")
-
         # 多进程 DataLoader 会 pickle Dataset。
         # 文件句柄不能安全共享，所以这里延迟到每个 worker 内部再打开。
         self._file = None
@@ -138,11 +130,9 @@ class JsonlDataset(Dataset):
 
 class PretrainDataset(JsonlDataset):
     """Causal LM 预训练数据集。
-
     期望 JSONL 每行至少包含：
     {"text": "..."}
     """
-
     def __init__(
         self,
         data_path: str | Path,

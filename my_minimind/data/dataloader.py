@@ -19,17 +19,14 @@ def language_model_collate_fn(
     batch: list[tuple[torch.Tensor, torch.Tensor]],
 ) -> dict[str, torch.Tensor]:
     """把 Dataset 产出的单条样本合并成一个 batch。
-
     Dataset 返回的是 (input_ids, labels)。
     训练循环通常更喜欢字典形式，后面可以直接传给 model(**batch) 或手动取字段。
     """
-
     input_ids, labels = zip(*batch)
     return {
         "input_ids": torch.stack(input_ids, dim=0),
         "labels": torch.stack(labels, dim=0),
     }
-
 
 def build_dataloader(
     dataset: Dataset,
@@ -40,7 +37,6 @@ def build_dataloader(
     drop_last: bool = True,
 ) -> DataLoader:
     """从 Dataset 构造 PyTorch DataLoader。"""
-
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -122,7 +118,6 @@ def create_dataloader(
     drop_last: bool = True,
 ) -> DataLoader:
     """按训练阶段创建 DataLoader。
-
     stage="pretrain"：读取 text 字段，训练普通续写。
     stage="sft"：读取 conversations 字段，只监督 assistant 回复。
     """
