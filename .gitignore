@@ -1,0 +1,28 @@
+# Python 运行缓存
+__pycache__/
+*.py[cod]
+
+# 本地环境和工具缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 大型训练数据不提交到 Git。
+# datasets/.gitignore 例外保留，用来让目录结构留在仓库里。
+/datasets/*
+!/datasets/.gitignore
+
+# 训练输出和 checkpoint 默认不提交。
+/my_minimind_out/
+/checkpoints/
+/out/
+
+
+# 大模型权重和数据集不要提交到 Git
+original_project/minimind-3/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+datasets/

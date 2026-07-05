@@ -1,0 +1,3 @@
+{"text": "你好，我正在手搓一个小语言模型。 tokenizer 会把文本转换成 token id。"}
+{"conversations": [{"role": "system", "content": "你是一个有帮助的 AI 助手。"}, {"role": "user", "content": "什么是 BPE 分词？"}, {"role": "assistant", "content": "BPE 会反复合并高频相邻片段，构造子词词表。"}]}
+{"text": "Large language models use tokenizers to convert text into tokens. PyTorch trains the model with input_ids and labels."}
