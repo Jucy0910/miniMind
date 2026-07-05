@@ -1,4 +1,4 @@
 from .config import MiniMindConfig
-from .layers import RMSNorm
+from .layers import RMSNorm, RotaryEmbedding
 
-__all__ = ["MiniMindConfig", "RMSNorm"]
+__all__ = ["MiniMindConfig", "RMSNorm", "RotaryEmbedding"]
