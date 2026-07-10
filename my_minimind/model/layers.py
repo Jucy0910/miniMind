@@ -3,7 +3,10 @@ from __future__ import annotations
 import math
 
 import torch
+import torch.nn.functional as F
 from torch import nn
+
+from .config import MiniMindConfig
 
 
 class RMSNorm(nn.Module):
@@ -168,3 +171,236 @@ class RotaryEmbedding(nn.Module):
         query_embed = query_states * cos + query_rotated_half * sin
         key_embed = key_states * cos + key_rotated_half * sin
         return query_embed.to(dtype=query_states.dtype), key_embed.to(dtype=key_states.dtype)
+
+
+class MiniMindAttention(nn.Module):
+    """MiniMind 使用的因果自注意力层。
+
+    这里实现的是 GQA：Query head 数量可以多于 Key/Value head 数量。
+    例如 MiniMind 默认 Q 有 8 个头，K/V 有 4 个头。
+    """
+
+    def __init__(self, config: MiniMindConfig):
+        super().__init__()
+
+        self.hidden_size = config.hidden_size
+        self.num_attention_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.head_dim = config.head_dim
+        self.num_key_value_groups = self.num_attention_heads // self.num_key_value_heads
+
+        # Q 投影保留完整 attention head 数。
+        # K/V 投影只生成较少的 KV head，这是 GQA 降低 KV cache 的关键。
+        self.q_proj = nn.Linear(
+            self.hidden_size,
+            self.num_attention_heads * self.head_dim,
+            bias=False,
+        )
+        self.k_proj = nn.Linear(
+            self.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            bias=False,
+        )
+        self.v_proj = nn.Linear(
+            self.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            bias=False,
+        )
+
+        # 注意力输出先是 num_attention_heads * head_dim，再投回 hidden_size。
+        self.o_proj = nn.Linear(
+            self.num_attention_heads * self.head_dim,
+            self.hidden_size,
+            bias=False,
+        )
+
+        # 原始 MiniMind 会对每个 head 内的 q/k 再做 RMSNorm。
+        self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        rotary_emb: RotaryEmbedding,
+        attention_mask: torch.Tensor | None = None,
+        past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
+        use_cache: bool = False,
+        start_pos: int = 0,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
+        """计算因果自注意力。
+        hidden_states 形状：[batch, seq_len, hidden_size]。
+        返回 output 形状仍然是：[batch, seq_len, hidden_size]。
+        """
+        batch_size, seq_len, _ = hidden_states.shape
+        # 1. 从同一份 hidden_states 投影出 Q/K/V。
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        # 2. 拆成多头布局。
+        #    Q: [batch, seq, q_heads, head_dim]
+        #    K/V: [batch, seq, kv_heads, head_dim]
+        query_states = query_states.view(
+            batch_size,
+            seq_len,
+            self.num_attention_heads,
+            self.head_dim,
+        )
+        key_states = key_states.view(
+            batch_size,
+            seq_len,
+            self.num_key_value_heads,
+            self.head_dim,
+        )
+        value_states = value_states.view(
+            batch_size,
+            seq_len,
+            self.num_key_value_heads,
+            self.head_dim,
+        )
+
+        # 3. 对每个 head 内的 Q/K 做 RMSNorm，然后注入 RoPE 位置信息。
+        query_states = self.q_norm(query_states)
+        key_states = self.k_norm(key_states)
+        if past_key_value is not None and start_pos == 0:
+            start_pos = past_key_value[0].shape[1]
+        query_states, key_states = rotary_emb(query_states, key_states, start_pos=start_pos)
+
+        # 4. 如果推理时传入了历史 K/V，把当前 K/V 拼到历史后面。
+        #    cache 中保存的是尚未 repeat 的 KV head，这样显存最省。
+        if past_key_value is not None:
+            past_key_states, past_value_states = past_key_value
+            key_states = torch.cat([past_key_states, key_states], dim=1)
+            value_states = torch.cat([past_value_states, value_states], dim=1)
+
+        present_key_value = (key_states, value_states) if use_cache else None
+
+        # 5. 真正的多头注意力计算放到类内部的独立函数里。
+        attn_output = self._compute_attention(
+            query_states=query_states,
+            key_states=key_states,
+            value_states=value_states,
+            attention_mask=attention_mask,
+        )
+
+        # 6. 合并多头并投回 hidden_size。
+        attn_output = attn_output.view(batch_size, seq_len, self.num_attention_heads * self.head_dim)
+        attn_output = self.o_proj(attn_output)
+        attn_output = self.resid_dropout(attn_output)
+        return attn_output, present_key_value
+
+    def _compute_attention(
+        self,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """执行多头注意力计算。
+        query_states: [batch, query_len, q_heads, head_dim]
+        key_states:   [batch, key_len, kv_heads, head_dim]
+        value_states: [batch, key_len, kv_heads, head_dim]
+        返回形状：  [batch, query_len, q_heads, head_dim]
+        """
+        batch_size, query_len, _, _ = query_states.shape
+        key_len = key_states.shape[1]
+        # 1. GQA：K/V head 少于 Q head，需要复制到和 Q head 数一致。
+        #    cache 里仍然保存较少的 KV head；只有真正算注意力时才临时展开。
+        if self.num_key_value_groups > 1:
+            key_states = key_states[:, :, :, None, :].expand(
+                batch_size,
+                key_len,
+                self.num_key_value_heads,
+                self.num_key_value_groups,
+                self.head_dim,
+            )
+            key_states = key_states.reshape(
+                batch_size,
+                key_len,
+                self.num_attention_heads,
+                self.head_dim,
+            )
+            value_states = value_states[:, :, :, None, :].expand(
+                batch_size,
+                key_len,
+                self.num_key_value_heads,
+                self.num_key_value_groups,
+                self.head_dim,
+            )
+            value_states = value_states.reshape(
+                batch_size,
+                key_len,
+                self.num_attention_heads,
+                self.head_dim,
+            )
+
+        # 2. 调整到注意力计算常用布局：[batch, heads, seq, head_dim]。
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
+
+        # 3. QK^T 得到注意力分数，除以 sqrt(head_dim) 稳定 softmax。
+        attn_scores = torch.matmul(query_states, key_states.transpose(-2, -1))
+        attn_scores = attn_scores / math.sqrt(self.head_dim)
+
+        # 4. 因果 mask：当前 token 不能看未来 token。
+        #    如果使用 KV cache，key_len 会大于 query_len，past_len 表示历史长度。
+        past_len = key_len - query_len
+        query_positions = past_len + torch.arange(query_len, device=query_states.device)
+        key_positions = torch.arange(key_len, device=query_states.device)
+        causal_mask = key_positions.unsqueeze(0) > query_positions.unsqueeze(1)
+        attn_scores = attn_scores.masked_fill(causal_mask[None, None, :, :], float("-inf"))
+
+        # 5. padding mask：1 表示有效 token，0 表示 padding。
+        if attention_mask is not None:
+            if attention_mask.shape[-1] != key_len:
+                raise ValueError(
+                    "attention_mask 最后一维必须等于 key_len，"
+                    f"当前 attention_mask.shape={tuple(attention_mask.shape)}, key_len={key_len}"
+                )
+            padding_mask = attention_mask[:, None, None, :] == 0
+            attn_scores = attn_scores.masked_fill(padding_mask, float("-inf"))
+
+        # 6. softmax 后对 V 加权求和。
+        attn_weights = F.softmax(attn_scores.float(), dim=-1).to(dtype=query_states.dtype)
+        attn_weights = self.attn_dropout(attn_weights)
+        attn_output = torch.matmul(attn_weights, value_states)
+
+        # 7. 还原回 [batch, query_len, heads, head_dim]。
+        return attn_output.transpose(1, 2).contiguous()
+
+
+class MiniMindMLP(nn.Module):
+    """MiniMind 的前馈网络，也就是 SwiGLU MLP。
+    结构是：
+    hidden_states -> gate_proj 和 up_proj
+    silu(gate_proj) * up_proj
+    down_proj 投回 hidden_size
+    """
+
+    def __init__(self, config: MiniMindConfig):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.hidden_act = config.hidden_act
+        if self.hidden_act != "silu":
+            raise ValueError(f"当前 MiniMindMLP 只实现 silu，收到 hidden_act={self.hidden_act!r}")
+        # gate_proj 和 up_proj 都从 hidden_size 升维到 intermediate_size。
+        # down_proj 再从 intermediate_size 投回 hidden_size。
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """执行 SwiGLU 前馈网络。"""
+
+        gate_states = self.gate_proj(hidden_states)
+        up_states = self.up_proj(hidden_states)
+
+        # SwiGLU 的核心：一个分支做 silu 门控，另一个分支提供内容。
+        hidden_states = F.silu(gate_states) * up_states
+        hidden_states = self.down_proj(hidden_states)
+        return hidden_states
