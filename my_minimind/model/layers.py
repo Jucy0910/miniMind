@@ -404,3 +404,59 @@ class MiniMindMLP(nn.Module):
         hidden_states = F.silu(gate_states) * up_states
         hidden_states = self.down_proj(hidden_states)
         return hidden_states
+
+
+class MiniMindBlock(nn.Module):
+    """一层完整的 MiniMind Transformer Block。
+    结构是 Pre-Norm：
+    hidden_states -> RMSNorm -> Attention -> 残差连接
+    hidden_states -> RMSNorm -> MLP       -> 残差连接
+    """
+
+    def __init__(self, config: MiniMindConfig):
+        super().__init__()
+
+        self.self_attn = MiniMindAttention(config)
+        self.mlp = MiniMindMLP(config)
+
+        # Attention 前的归一化。
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        # MLP 前的归一化。
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        rotary_emb: RotaryEmbedding,
+        attention_mask: torch.Tensor | None = None,
+        past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
+        use_cache: bool = False,
+        start_pos: int = 0,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
+        """执行一层 Transformer Block。
+
+        hidden_states 形状：[batch, seq_len, hidden_size]。
+        返回新的 hidden_states，以及可选的 present_key_value。
+        """
+
+        # 1. Attention 子层：先归一化，再注意力，再残差相加。
+        residual = hidden_states
+        normed_hidden_states = self.input_layernorm(hidden_states)
+        attn_output, present_key_value = self.self_attn(
+            hidden_states=normed_hidden_states,
+            rotary_emb=rotary_emb,
+            attention_mask=attention_mask,
+            past_key_value=past_key_value,
+            use_cache=use_cache,
+            start_pos=start_pos,
+        )
+        hidden_states = residual + attn_output
+
+        # 2. MLP 子层：同样先归一化，再 MLP，再残差相加。
+        residual = hidden_states
+        normed_hidden_states = self.post_attention_layernorm(hidden_states)
+        mlp_output = self.mlp(normed_hidden_states)
+        hidden_states = residual + mlp_output
+
+        return hidden_states, present_key_value

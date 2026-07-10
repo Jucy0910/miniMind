@@ -61,7 +61,6 @@ def pre_processing_chat(
 
 def post_processing_chat(prompt: str, empty_think_ratio: float = 0.2) -> str:
     """对 chat_template 生成后的文本做和原始 MiniMind 相同的后处理。"""
-
     # tokenizer_config 里的模板会给 assistant 消息添加空 thinking 块。
     # 原始项目按概率保留一部分空 thinking，其余样本移除，让训练数据更多样。
     empty_think = "<think>\n\n</think>\n\n"
@@ -86,13 +85,10 @@ class JsonlDataset(Dataset):
         # 多进程 DataLoader 会 pickle Dataset。
         # 文件句柄不能安全共享，所以这里延迟到每个 worker 内部再打开。
         self._file = None
-
     def __len__(self) -> int:
         return len(self.offsets)
-
     def __getstate__(self) -> dict[str, Any]:
         """让 DataLoader worker 拿到 Dataset 时重新打开自己的文件句柄。"""
-
         state = self.__dict__.copy()
         state["_file"] = None
         return state
