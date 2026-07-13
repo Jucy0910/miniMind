@@ -96,7 +96,6 @@ class JsonlDataset(Dataset):
     @staticmethod
     def _build_offsets(path: Path) -> list[int]:
         """扫描 JSONL 文件，记录每一条非空样本的起始位置。"""
-
         offsets: list[int] = []
         with path.open("rb") as f:
             while True:
@@ -110,14 +109,12 @@ class JsonlDataset(Dataset):
 
     def _get_file(self):
         """获取当前进程自己的文件句柄。"""
-
         if self._file is None or self._file.closed:
             self._file = self.data_path.open("rb")
         return self._file
 
     def read_record(self, index: int) -> dict[str, Any]:
         """读取指定下标的 JSON 对象。"""
-
         f = self._get_file()
         f.seek(self.offsets[index])
         line = f.readline().decode("utf-8", errors="ignore")
@@ -145,7 +142,6 @@ class PretrainDataset(JsonlDataset):
         record = self.read_record(index)
         if self.text_field not in record:
             raise ValueError(f"样本缺少字段：{self.text_field}")
-
         # 预训练只学习连续文本本身，不走 chat_template。
         text = str(record[self.text_field])
         token_ids = self.tokenizer(
@@ -154,17 +150,14 @@ class PretrainDataset(JsonlDataset):
             max_length=self.max_length - 2,
             truncation=True,
         ).input_ids
-
         # 显式拼接 BOS/EOS，和原始 MiniMind 的预训练数据处理一致。
         token_ids = [self.tokenizer.bos_token_id] + token_ids + [self.tokenizer.eos_token_id]
         input_ids = self._pad_to_max_length(token_ids)
         labels = input_ids.clone()
         labels[input_ids == self.tokenizer.pad_token_id] = IGNORE_INDEX
         return input_ids, labels
-
     def _pad_to_max_length(self, token_ids: list[int]) -> torch.Tensor:
         """把一条样本补齐到固定长度，方便 DataLoader 堆叠 batch。"""
-
         pad_count = self.max_length - len(token_ids)
         if pad_count < 0:
             token_ids = token_ids[: self.max_length]
