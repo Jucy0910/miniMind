@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from .config import MiniMindConfig
 from .layers import MiniMindBlock, RMSNorm, RotaryEmbedding
@@ -15,12 +18,26 @@ KVCache = tuple[torch.Tensor, torch.Tensor]
 PastKeyValues = tuple[KVCache, ...]
 
 
+@dataclass
+class CausalLMOutput:
+    """因果语言模型一次前向传播的输出。
+    使用具名字段保存结果，比依靠元组中第几个位置更容易阅读：
+    - logits：模型对每个位置、每个词表 token 给出的原始分数；
+    - loss：传入 labels 时计算得到的语言模型损失，否则为 None；
+    - past_key_values：use_cache=True 时返回的逐层 KV cache，否则为 None。
+    """
+
+    logits: torch.Tensor
+    loss: torch.Tensor | None = None
+    past_key_values: PastKeyValues | None = None
+
+
 class MiniMindModel(nn.Module):
     """MiniMind 基础模型主干。
     这个类负责：
     input_ids -> Token Embedding -> 多层 MiniMindBlock -> Final RMSNorm。
     它输出 hidden_states，不负责投影到词表，也不负责计算语言模型 loss。
-    LM Head 和 loss 会在后续 MiniMindForCausalLM 中实现。
+    这些工作由文件下方的 MiniMindForCausalLM 负责。
     """
 
     def __init__(self, config: MiniMindConfig):
@@ -48,6 +65,7 @@ class MiniMindModel(nn.Module):
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         # 5. 按 MiniMindConfig.initializer_range 初始化可训练权重。
         self.apply(self._init_weights)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -122,3 +140,115 @@ class MiniMindModel(nn.Module):
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
+
+
+class MiniMindForCausalLM(nn.Module):
+    """用于因果语言建模的完整 MiniMind 模型。
+    MiniMindModel 只负责把 input_ids 转换成 hidden_states。
+    这个类在模型主干外再增加两部分：
+    1. LM Head：把 hidden_size 维的隐藏状态投影成 vocab_size 维词表分数；
+    2. Causal LM loss：让当前位置预测它后面的下一个 token。
+    因此，预训练时可以直接调用：
+        output = model(input_ids=input_ids, labels=labels)
+        loss = output.loss
+    """
+
+    def __init__(self, config: MiniMindConfig):
+        super().__init__()
+        self.config = config
+
+        # 1. MiniMindModel 是已经完成的 Transformer 主干。
+        self.model = MiniMindModel(config)
+
+        # 2. LM Head 把每个 token 的隐藏向量映射为整个词表上的预测分数。
+        #    输入形状：[batch, seq_len, hidden_size]
+        #    输出形状：[batch, seq_len, vocab_size]
+        self.lm_head = nn.Linear(
+            config.hidden_size,
+            config.vocab_size,
+            bias=False,
+        )
+
+        if config.tie_word_embeddings:
+            # 输入 Embedding 和输出 LM Head 共享同一块权重。
+            # 两者虽然用途不同，但权重形状都是 [vocab_size, hidden_size]。
+            # 共享后可以减少参数量，并让同一个 token 的输入、输出表示相互约束。
+            self.lm_head.weight = self.model.embed_tokens.weight
+        else:
+            # 不共享权重时，LM Head 是一份独立参数，需要单独初始化。
+            # 这里不调用 self.apply，避免把主干中已经初始化的参数再次初始化。
+            nn.init.normal_(
+                self.lm_head.weight,
+                mean=0.0,
+                std=config.initializer_range,
+            )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        labels: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        past_key_values: PastKeyValues | None = None,
+        use_cache: bool = False,
+    ) -> CausalLMOutput:
+        """执行因果语言模型前向传播，并按需计算 next-token loss。
+
+        input_ids 和 labels 的形状都应该是 [batch, seq_len]。
+        labels 中等于 -100 的位置会被交叉熵忽略，不参与 loss 计算。
+        """
+
+        # 1. Transformer 主干产生每个 token 对应的隐藏状态。
+        hidden_states, present_key_values = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+        )
+
+        # 2. LM Head 为序列中每个位置生成完整词表上的原始预测分数。
+        #    logits 还没有经过 softmax，因为 CrossEntropyLoss 内部会完成该计算。
+        logits = self.lm_head(hidden_states)
+
+        # 推理时通常不传 labels，此时只需要返回 logits 和可选的 KV cache。
+        loss: torch.Tensor | None = None
+
+        if labels is not None:
+            if labels.shape != input_ids.shape:
+                raise ValueError(
+                    "labels 的形状必须和 input_ids 完全一致，"
+                    f"当前 labels.shape={tuple(labels.shape)}, "
+                    f"input_ids.shape={tuple(input_ids.shape)}"
+                )
+
+            if input_ids.shape[1] < 2:
+                raise ValueError("计算语言模型 loss 时，序列长度至少需要为 2")
+
+            # 3. 因果语言模型学习“根据前文预测下一个 token”。
+            #
+            # 假设原始序列为：[我, 爱, 学, 习]
+            # 输入位置使用：  [我, 爱, 学]
+            # 监督目标使用：  [爱, 学, 习]
+            #
+            # 所以 logits 去掉最后一个位置，labels 去掉第一个位置，
+            # 二者便能在时间维度上一一对应。
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
+
+            # 4. CrossEntropy 接收二维预测分数和一维目标 token id，
+            #    因此把 batch 和 seq_len 两个维度合并到一起。
+            flat_logits = shift_logits.view(-1, self.config.vocab_size)
+            flat_labels = shift_labels.view(-1)
+
+            # ignore_index=-100 与 Dataset 产生的 labels 约定一致。
+            # padding、问题部分等不需要监督的位置会被完全排除在 loss 之外。
+            loss = F.cross_entropy(
+                flat_logits,
+                flat_labels,
+                ignore_index=-100,
+            )
+
+        return CausalLMOutput(
+            logits=logits,
+            loss=loss,
+            past_key_values=present_key_values,
+        )
