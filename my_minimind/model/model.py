@@ -173,7 +173,7 @@ class MiniMindForCausalLM(nn.Module):
             # 输入 Embedding 和输出 LM Head 共享同一块权重。
             # 两者虽然用途不同，但权重形状都是 [vocab_size, hidden_size]。
             # 共享后可以减少参数量，并让同一个 token 的输入、输出表示相互约束。
-            self.lm_head.weight = self.model.embed_tokens.weight
+            self.lm_head.weight = self.model.embed_tokens.weight #模型内部会自行进行转置
         else:
             # 不共享权重时，LM Head 是一份独立参数，需要单独初始化。
             # 这里不调用 self.apply，避免把主干中已经初始化的参数再次初始化。
@@ -246,7 +246,6 @@ class MiniMindForCausalLM(nn.Module):
                 flat_labels,
                 ignore_index=-100,
             )
-
         return CausalLMOutput(
             logits=logits,
             loss=loss,
